@@ -1,0 +1,22 @@
+[project]
+name = "cuebridge-memory"
+version = "1.0.0"
+description = "CueBridge Memory — AML 兼容的记忆侧 Add/Search 服务（text-embedding-v4 + Qwen3-Reranker-4B + gpt-4o-mini 证据选择）"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "httpx>=0.27",
+  "pydantic>=2.5",
+  "numpy>=1.24",
+  "jieba>=0.42",
+  "pillow>=10.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["amc*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
