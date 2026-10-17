@@ -26,3 +26,4 @@ bash scripts/aml_preflight.sh    # 上线前检查（key / 嵌入维度 / LLM / 
 bash scripts/start_memory_api.sh # 起服务（0.0.0.0:8000）
 bash scripts/aml_selfcheck.sh    # 公网自检：health / add / search / 契约 / 401
 ```
+
