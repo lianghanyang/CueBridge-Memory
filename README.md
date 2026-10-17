@@ -50,17 +50,12 @@ cd CueBridge-Memory
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env          # 填入 DASHSCOPE_API_KEY / gpt-4o-mini KEY / MEMORY_SYSTEM_KEY
-set -a; source .env; set +a
+# 要先设置 DASHSCOPE_API_KEY / gpt-4o-mini KEY / MEMORY_SYSTEM_KEY
 
-bash scripts/start_memory_api.sh          # 默认 0.0.0.0:8000，带崩溃自愈守护
+
+bash scripts/start_memory_api.sh      
 curl -s localhost:8000/health | head -c 200
 ```
-
-`MEMORY_SYSTEM_KEY` 就是报名表里的「记忆系统 Key」；调用方需带
-`Authorization: Token <MEMORY_SYSTEM_KEY>`。
-
-也可以直接前台运行：`PYTHONPATH=. python -m scripts.serve_memory --host 0.0.0.0 --port 8000`
 
 ## Docker 部署
 
@@ -76,10 +71,6 @@ docker run --rm -p 8000:8000 \
   -v "$(pwd)/data:/app/data" \
   cuebridge-memory:1.0.0
 ```
-
-本地 4B 重排器需要 GPU，使用 `--gpus all` 或在 `compose.yaml` 中保留 devices 段。
-模型缓存较大，正式服务器建议额外挂载 Hugging Face 缓存目录。
-**不要把密钥写入 Dockerfile、镜像、GitHub 或公开 URL。**
 
 ```bash
 docker compose up --build -d
@@ -103,9 +94,9 @@ Authorization: Token <MEMORY_SYSTEM_KEY>
 Content-Type: application/json
 
 {
-  "user_id":    "u_123",                 // 必填，非空字符串
-  "session_id": "s_456",                 // 必填，非空字符串
-  "request_id": "r_789",                 // 必填，非空字符串（同一"轮"的标识）
+  "user_id":    "u_123",               
+  "session_id": "s_456",                
+  "request_id": "r_789",               
   "messages": [
     {"role": "user",      "content": "…",                      "timestamp": 1760000000000},
     {"role": "assistant", "content": [{"type": "text", "text": "…"}], "timestamp": 1760000005000}
@@ -185,22 +176,6 @@ key 错误或缺失返回 `401`。
 > 「整体」数字都必须标注它是在哪个配置下测的。详见
 > [docs/DEPLOY_STATUS.md](docs/DEPLOY_STATUS.md)。
 
-## 公网接入
-
-推荐 **Cloudflare 命名隧道**（固定域名、无响应超时）：
-
-```bash
-cloudflared tunnel login
-cloudflared tunnel create cuebridge
-cloudflared tunnel route dns cuebridge memory.example.com
-AMC_TUNNEL=cloudflared-named AMC_TUNNEL_NAME=cuebridge \
-  AMC_PUBLIC_DOMAIN=memory.example.com bash scripts/start_public_tunnel.sh
-```
-
-其它可选：`AMC_TUNNEL=cloudflared`（临时随机域名）、`ngrok`（保留域名）、
-`serveo`（固定子域，但**免费版约 6 秒即切断响应**，>6 s 的请求一律 502，
-只适合纯文本场景）。多模态查询请用前两者。
-
 ## 测试
 
 ```bash
@@ -241,15 +216,4 @@ bash scripts/aml_selfcheck.sh     # 公网端到端：health -> add -> search ->
 | [docs/DEPLOY_STATUS.md](docs/DEPLOY_STATUS.md) | 当前部署状态、实测指标与踩坑记录 |
 | [MANIFEST.md](MANIFEST.md) | 交付物清单与复现路径 |
 
-## 报名表填写对照
 
-| 表单字段 | 填什么 |
-|---|---|
-| 系统名称 | `CueBridge Memory` |
-| 版本名称 | `v1.0` |
-| Add API 地址 | `https://memory.cuebridge.top/v1/memories/add` |
-| Search API 地址 | `https://memory.cuebridge.top/v1/memories/search` |
-| 认证方式 | `Authorization: Token` |
-| 记忆系统 Key | `.env` 里的 `MEMORY_SYSTEM_KEY` |
-| 公开 GitHub 仓库 | 本仓库 |
-| 提交说明与运行指南 | 本 README |
