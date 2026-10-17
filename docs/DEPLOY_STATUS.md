@@ -351,3 +351,48 @@ AMC_RELATION_SELECT_POOL=14
 | 日志 | `prompt=evidence_set dedup_rounds=True gate_margin=0.0000` + `relation-select … model=gpt-4o-mini` |
 | 公网自检 | **5/5 通过** |
 | 图像查询（视觉桥 + 关系选择） | HTTP 200，7.5 s，返回 5 条，`content` 为字符串 |
+
+---
+
+## 12. 赛事服务 vs 离线评测：口径对齐核查（2026-10-17）
+
+**问题**：线上服务跑出来的效果，和离线跑测的数字，是不是同一件事？
+
+### 12.1 生效配置逐项 diff（线上 `.env` vs 离线跑测脚本）
+
+| 字段 | 赛事服务 | 离线跑测 | 影响 |
+|---|---|---|---|
+| **`retrieval_limit`** | **120** | **30** | 进 4B 精排的候选数；**实测对 R@1/Hit@1 无影响**（见 12.3） |
+| `retriever` | `hybrid_round_rerank` | `hybrid_round` | 等价：`build_retriever` 在 settings 有 reranker 时**强制启用**精排，两条名字构建出的链路相同 |
+| `llm_rerank` / 模型 / 提示 / 门控 / 去重 / pool / layout / doc_chars | `gpt-4o-mini` / `evidence_set` / 0 / True / 12 / round / 1400 | 完全相同 | — |
+| `query_vision` / `relation_select`（pool）/ `skip_marker` | **True / True(14) / `[Query image]`** | **False / False(10) / 空** | **仅图像路**；文本查询不触发 |
+| `fusion=auto`、`rerank_unit=round`、`search_content_format=text`、`max_return=50`、`text-embedding-v4`(1024) | 一致 | 一致 | — |
+
+### 12.2 数据等价性
+
+线上库 79,218 行 / 209 用户（历次摄入的多个命名空间：`pf-frozen-cd:`、`pf-cd-frozen-v1:`、
+`pf-frozen-cd-seed0:`、`rerun-*:`、`text-v4-*:` 各 20 用户 + 9 个自检用户）；
+离线库 7,924 行 / 20 用户（`eval:local-v1:multimodal:*`）。
+
+按用户比对 `index_text` 集合：**370 行 vs 370 行、内容哈希 `8428c09e` 完全相同**
+⇒ 同一批数据、仅 `user_id` 命名空间不同；`user_id` 隔离下每查询候选集等价。
+
+### 12.3 `retrieval_limit` 30 vs 120 配对实测（text 路 100 条）
+
+| 指标 | 30 | 120 | 配对 Δ（120−30，95% CI） | 逐样本不同条数 |
+|---|---|---|---|---|
+| R@1 | 0.5275 | 0.5275 | **+0.0000 [0.0000, 0.0000]** ⚪ | **0 / 100** |
+| Hit@1 | 0.7400 | 0.7400 | **+0.0000 [0.0000, 0.0000]** ⚪ | **0 / 100** |
+| R@n_gold | 0.6428 | 0.6478 | +0.0050 [0.0000, +0.0150] ⚪ | 1 / 100 |
+
+⇒ 轮级 4B 精排的 top-1 不随候选池扩大而改变（融合头部已含胜者），
+LLM 档只吃 12 个候选 ⇒ **文本路上"赛事服务 ≈ 离线评测"成立**。
+
+### 12.4 仍然**不**等价的三处（报告数字时必须标注）
+
+1. **图像路**：离线数字里 `query_vision` / `relation_select` 关闭，线上开启；
+   图像档收益是 LOO 单测（查询图桥 **+0.0606 R@1**、关系选择 +0.0075），**不在 0.5555 之内**；
+2. **覆盖范围**：0.5555 为**文本路 1,040 条**；线上还要服务 Mem-Gallery 另外 **487 条图像查询**，
+   整体表现 = 文本路 + 图像路的加权；
+3. **全库 1,527 的 0.4690 是旧配置**（qwen-flash + round_rank + 门控）的数字；
+   **最终配置（gpt-4o-mini + evidence_set）的全库数字尚未测**——报告中不得混用。
