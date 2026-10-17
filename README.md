@@ -18,29 +18,21 @@ Add/Search API。系统以「对话轮」为第一级单位索引与打分：`te
 ```
 
 赛事服务只返回记忆证据，**不生成最终答案**；官方平台负责 Answer 和 Eval。
-本地工具只能用于预检和公开数据分析，不能生成官方 Smoke/Full 成绩。
 
-项目**只修改记忆侧**，不改动 answer 侧。合规约束如下：
+
+项目**为记忆侧**，合规约束如下：
 
 | 要求 | 本系统做法 |
 |---|---|
 | Embedding **必须** `text-embedding-v4` | 全链路唯一向量模型（1024 维），未替换、未混用；图片不进入向量层 |
 | LLM 相关组件**必须** `gpt-4o-mini` | 证据选择档、查询图描述、关系选择三处调用统一走 `gpt-4o-mini` |
 | Reranker **不限制** | 使用 `Qwen3-Reranker-4B`（cross-encoder，轮级打分） |
-| 参赛方自行部署公网 Add/Search API | 本仓库提供启动脚本 + 隧道脚本 + 自检脚本 |
-| 不改动 answer 侧 | 仓库内只含记忆侧代码 |
 
 ## 服务器要求
 
 - Linux 服务器；
 - Python 3.10 至 3.12，或 Docker；
 - **一张 ≥9 GB 显存的 GPU** 用于本地 4B 重排器（纯 API 部署可换成不含本地重排器的组合）；
-- 出网：DashScope（`text-embedding-v4`）+ `gpt-4o-mini` 兼容网关；
-- 公网 HTTPS 入口：本仓库脚本默认用 `cloudflared`，也可用任意反向代理或端口映射；
-- 首次启动需要能访问模型仓库（或提前准备本地模型目录）。
-
-建立数据库后不要直接更换 embedding 模型：不同模型的向量维度可能不一致。
-如需更换，应使用新的数据库文件重新写入数据。
 
 ## Python 部署
 
@@ -89,7 +81,7 @@ curl -s https://memory.cuebridge.top/v1/memories/health
 ### Add
 
 ```http
-POST /v1/memories/add          （等价路径：/add）
+POST /v1/memories/add       
 Authorization: Token <MEMORY_SYSTEM_KEY>
 Content-Type: application/json
 
@@ -135,21 +127,14 @@ key 错误或缺失返回 `401`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MEMORY_SYSTEM_KEY` | 空 | 对外鉴权 key（报名表里的「记忆系统 Key」） |
-| `AMC_EMBEDDING_MODEL` | `text-embedding-v4` | 固定不可改（比赛要求） |
+| `MEMORY_SYSTEM_KEY` | 空 | 对外鉴权 key |
+| `AMC_EMBEDDING_MODEL` | `text-embedding-v4` | 比赛要求 |
 | `AMC_RETRIEVER` | `hybrid_round_rerank` | dense + 轮通道 + `bm25_anchor` 融合 |
-| `AMC_FUSION` | `auto` | 只看可观测的轮结构做路由，不识别数据集 |
+| `AMC_FUSION` | `auto` | 可观测的轮结构做路由 |
 | `AMC_RERANKER_MODEL` | 空 | 本地 4B 重排器路径（`Qwen3-Reranker-4B`） |
 | `AMC_RERANK_UNIT` | `round` | 以整轮为打分单位 |
-| `AMC_LLM_RERANK` | `0` | 开关 LLM 证据选择档（比赛用 `1`） |
-| `AMC_LLM_RERANK_MODEL` | `gpt-4o-mini` | 固定不可改（比赛要求） |
-| `AMC_LLM_RERANK_PROMPT` | `evidence_set` | 生产口径实测：`gpt-4o-mini` 下优于 `round_rank` |
-| `AMC_LLM_RERANK_GATE_MARGIN` | `0` | 置信度门控阈值；`0` = 关闭 |
-| `AMC_LLM_RERANK_DEDUP_ROUNDS` | `1` | 候选窗口按轮去重（修复重复占位） |
-| `AMC_LLM_RERANK_POOL` | `12` | 送入 LLM 的轮级候选数 |
-| `AMC_LLM_RERANK_SKIP_MARKER` | 空 | 命中即跳过 LLM 档（比赛设为 `[Query image]`） |
-| `AMC_QUERY_VISION` | `0` | 查询图→文本桥（`gpt-4o-mini` 视觉） |
-| `AMC_RELATION_SELECT` | `0` | 关系感知证据选择（结构化卡片 + 逐对） |
+| `AMC_LLM_RERANK_MODEL` | `gpt-4o-mini` | 比赛要求 |
+| `AMC_RELATION_SELECT` | `0` | 关系感知证据选择（结构化卡片） |
 
 ## 效果摘要
 
@@ -157,11 +142,10 @@ key 错误或缺失返回 `401`。
 
 | 配置 | R@1 | Hit@1 | R@n_gold |
 |---|---|---|---|
-| 只上 4B（无 LLM 档） | 0.5147 | 0.7433 | 0.6753 |
-| `gpt-4o-mini` + `round_rank` | 0.5447 | 0.7760 | 0.7284 |
+| Qwen3-Reranker-4B | 0.5147 | 0.7433 | 0.6753 |
 | **`gpt-4o-mini` + `evidence_set`（当前配置）** | **0.5555** | **0.8010** | **0.7345** |
 
-最终配置相对「只上 4B」的配对提升：**R@1 +0.0408**、**Hit@1 +0.0577**、
+最终配置相对Qwen3-Reranker-4B的配对提升：**R@1 +0.0408**、**Hit@1 +0.0577**、
 **R@n_gold +0.0592**（三项 95% 自助置信区间均不含 0）。
 
 **全库端到端**（Mem-Gallery 1,527 条，一次跑完）：基线 0.4312 → 本系统 **0.4690**
