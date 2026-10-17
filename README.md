@@ -187,9 +187,6 @@ bash scripts/aml_selfcheck.sh     # 公网端到端：health -> add -> search ->
 | `scripts/` | 启动、隧道、上线前检查、公网自检 |
 | `tests/` | 离线单元测试 |
 | `Dockerfile`、`compose.yaml` | 容器化部署 |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构与各模块收益（局部 + 整体） |
-| [docs/RUNBOOK.md](docs/RUNBOOK.md) | 启停、健康检查、故障处理、合规注意 |
-| [docs/DEPLOY_STATUS.md](docs/DEPLOY_STATUS.md) | 当前部署状态、实测指标与踩坑记录 |
 | [MANIFEST.md](MANIFEST.md) | 交付物清单与复现路径 |
 
 

@@ -9,8 +9,6 @@
 | 记忆服务 | `amc/` | FastAPI 应用、存储、契约、检索与重排 |
 | 运维脚本 | `scripts/` | 启动、隧道、上线前检查、公网自检 |
 | 测试 | `tests/` | 契约 / 鉴权 / LLM 输出解析（20 例，离线秒级） |
-| 架构与运维 | `docs/ARCHITECTURE.md`、`docs/RUNBOOK.md` | 模块收益（LOO）与故障处理 |
-| 部署实况 | `docs/DEPLOY_STATUS.md` | 当前地址、实测指标、踩坑记录（最有信息量的一篇） |
 
 ## 不随仓库提交的内容
 
