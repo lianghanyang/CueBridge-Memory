@@ -5,7 +5,7 @@ Add/Search API。系统以「对话轮」为第一级单位索引与打分：`te
 做稠密检索，`Qwen3-Reranker-4B` 做精排，LLM 组件统一使用 `gpt-4o-mini`，
 并把查询图片转成检索用文字描述接入纯文本链路。
 
-当前版本：`v1.0`
+当前版本：`v1.0.0`
 
 ## 系统边界
 
@@ -41,10 +41,7 @@ git clone https://github.com/lianghanyang/CueBridge-Memory.git
 cd CueBridge-Memory
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
 # 要先设置 DASHSCOPE_API_KEY / gpt-4o-mini KEY / MEMORY_SYSTEM_KEY
-
-
 bash scripts/start_memory_api.sh      
 curl -s localhost:8000/health | head -c 200
 ```
