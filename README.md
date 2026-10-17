@@ -2,8 +2,7 @@
 
 一个面向 Agent Memory Leaderboard 的长期记忆检索服务，提供 AML 兼容的同步
 Add/Search API。系统以「对话轮」为第一级单位索引与打分：`text-embedding-v4`
-做稠密检索，`Qwen3-Reranker-4B` 做精排，LLM 组件统一使用 `gpt-4o-mini`，
-并把查询图片转成检索用文字描述接入纯文本链路。
+做稠密检索，`Qwen3-Reranker-4B` 做精排，LLM 组件统一使用 `gpt-4o-mini`。
 
 当前版本：`v1.0.0`
 
@@ -135,8 +134,7 @@ key 错误或缺失返回 `401`。
 
 ## 公开数据验证
 
-1.0.0 冻结前在**两个公开数据集**上做了配对验证，全部经官方 `MemoryService.search`（与线上服务同一路径），
-两个系统使用同一批记忆、同一 `text-embedding-v4`（1024 维）与同一 `top_k=100` 的检索口径，
+目前在Mem-Gallery和ATM-Bench上做了配对验证，两个系统使用同一批记忆、同一 `text-embedding-v4`（1024 维）与同一 `top_k=100` 的检索口径，
 唯一差别是基线不启用 LLM 证据选择档。该实验没有读取或分析任何官方 Smoke 私有负载。
 
 | 数据集（n） | 指标 | 基线 | CueBridge Memory 1.0.0 | 配对 Δ [95% CI] |
