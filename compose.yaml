@@ -1,0 +1,20 @@
+# CueBridge Memory — 一键起服务（docker compose up -d）
+services:
+  cuebridge-memory:
+    build: .
+    image: cuebridge-memory:1.0.0
+    env_file:
+      - .env                      # 从这里读密钥（text-embedding-v4 / gpt-4o-mini / MEMORY_SYSTEM_KEY）
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          # 记忆库、blob、embedding 缓存
+    restart: unless-stopped
+    # 本地 4B 重排器需要 GPU；纯 CPU/纯 API 部署请删掉这一段并调整 AMC_RETRIEVER
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

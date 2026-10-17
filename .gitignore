@@ -1,0 +1,28 @@
+# 密钥与本地配置（严禁提交）
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials*.json
+
+# 数据与运行产物
+data/*
+!data/sample_*.jsonl
+artifacts/
+*.db
+*.sqlite3
+*.log
+reports/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store

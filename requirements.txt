@@ -1,0 +1,14 @@
+# CueBridge Memory — 记忆侧依赖（Add/Search 服务 + 检索/重排）
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27
+pydantic>=2.5
+numpy>=1.24
+jieba>=0.42
+pillow>=10.0
+python-multipart>=0.0.9
+# 向量库（混合检索）
+faiss-cpu>=1.7 ; platform_machine == "x86_64"
+# 本地重排器（Qwen3-Reranker-4B）依赖；纯 API 部署可省略
+# torch>=2.1
+# transformers>=4.44
