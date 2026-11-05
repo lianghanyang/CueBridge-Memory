@@ -21,7 +21,7 @@ done
 
 EMB_BASE="${AMC_EMBEDDING_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
 EMB_KEY="${AMC_EMBEDDING_API_KEY:-${DASHSCOPE_API_KEY:-}}"
-LLM_BASE="${AMC_LLM_RERANK_BASE_URL:-https://9527.codes/v1}"
+LLM_BASE="${AMC_LLM_RERANK_BASE_URL:-https://llm-proxy.example"
 LLM_KEY="${AMC_LLM_RERANK_API_KEY:-${OPENAI_API_KEY:-}}"
 LLM_MODEL="${AMC_LLM_RERANK_MODEL:-gpt-4o-mini}"
 

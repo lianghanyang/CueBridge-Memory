@@ -35,6 +35,13 @@ import httpx
 
 logger = logging.getLogger("amc.vl_rerank")
 
+PROVENANCE_PROMPT = (
+    "Decide whether the Document contains or refers to the SAME PICTURE as the QUERY image. "
+    "Answer yes only if the Document's image is the one the user is asking about "
+    "(the same picture, or the same specific subject and scene). "
+    "Topical or thematic similarity is NOT enough."
+)
+
 SYSTEM_PROMPT = ('Judge whether the Document meets the requirements based on the Query and '
                  'the Instruct provided. Note that the answer can only be "yes" or "no".')
 
@@ -68,7 +75,8 @@ class VLRerankClient:
     def __init__(self, base_url: str, model: str, pool: int = 5, timeout: float = 60.0,
                  workers: int = 8, retries: int = 2, cache_path: Optional[str] = None,
                  include_doc_image: bool = False, max_doc_chars: int = 1200,
-                 requires_query_image: bool = True, max_query_images: int = 1):
+                 requires_query_image: bool = True, max_query_images: int = 1,
+                 instruct: str = "provenance"):
         self.base_url = (base_url or "").rstrip("/")
         self.model = model
         self.pool = max(1, int(pool))
@@ -78,9 +86,15 @@ class VLRerankClient:
         self.max_doc_chars = int(max_doc_chars)
         self.requires_query_image = bool(requires_query_image)
         self.max_query_images = max(1, int(max_query_images))
+        # instruct 选择：provenance（默认，判"图中图是否同一张"）| relevance（旧行为）
+        # 487 条实测：provenance 版 Hit@1 +6.4pp / R@1 +2.5pp（同一评分函数、同一候选）
+        self.instruct = instruct if instruct in ("provenance", "relevance") else "provenance"
         self.client = httpx.Client(timeout=timeout)
         self.lock = threading.Lock()
-        self.stats = {"calls": 0, "scored": 0, "cached": 0, "failed": 0, "skipped_no_image": 0}
+        self.stats = {"calls": 0, "scored": 0, "cached": 0, "failed": 0,
+                      "skipped_no_image": 0, "doc_image_used": 0, "round_text_used": 0}
+        self._margins: List[float] = []
+        self.max_doc_image_side = 384
         self._mem: Dict[str, float] = {}
         self._db: Optional[sqlite3.Connection] = None
         if cache_path:
@@ -143,9 +157,10 @@ class VLRerankClient:
         dc: List[Dict[str, Any]] = [{"type": "text", "text": doc_text[: self.max_doc_chars]}]
         if doc_image:
             dc.append({"type": "image_url", "image_url": {"url": doc_image}})
+        sys_prompt = PROVENANCE_PROMPT if self.instruct == "provenance" else SYSTEM_PROMPT
         body = {"model": self.model, "temperature": 0.0, "max_tokens": 1,
                 "logprobs": True, "top_logprobs": 20,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                "messages": [{"role": "system", "content": sys_prompt},
                              {"role": "query", "content": qc},
                              {"role": "document", "content": dc}]}
         for _ in range(self.retries):
@@ -160,16 +175,60 @@ class VLRerankClient:
         return None
 
     def _doc_image_uri(self, store, memory: Dict[str, Any]) -> Optional[str]:
-        """候选记忆的首张图（仅在 include_doc_image 时取）。缺失 blob 时返回 None。"""
+        """候选记忆的首张图（仅在 include_doc_image 时取），**缩放到安全尺寸**。
+
+        教训：直接发原图时单张可到 ~1.2 MB，请求体过大被网关整包拒绝（全部候选 0 分）。
+        """
         try:
-            from .imaging import encode_data_uri
+            from .imaging import encode_data_uri, vlm_ready_image
             for part in (memory.get("content") or []):
                 if isinstance(part, dict) and part.get("type") == "image_ref":
                     raw = store.blob_path(part["sha256"], part.get("fmt", "jpeg")).read_bytes()
-                    return encode_data_uri(raw, part.get("fmt"))
+                    small, fmt = vlm_ready_image(raw, part.get("fmt"))
+                    side = getattr(self, "max_doc_image_side", 384)
+                    try:
+                        from PIL import Image
+                        import io as _io
+                        while len(small) > 200_000 and side >= 128:
+                            im = Image.open(_io.BytesIO(small)).convert("RGB")
+                            w, h = im.size
+                            sc = side / float(max(w, h))
+                            im = im.resize((max(1, int(w * sc)), max(1, int(h * sc))), Image.LANCZOS)
+                            out = _io.BytesIO(); im.save(out, "JPEG", quality=80)
+                            small, fmt = out.getvalue(), "jpeg"
+                            side = max(128, side // 2)
+                    except Exception:
+                        pass
+                    with self.lock:
+                        self.stats["doc_image_used"] = self.stats.get("doc_image_used", 0) + 1
+                    return encode_data_uri(small, fmt)
         except Exception:
             return None
         return None
+
+    def _round_text(self, store, memory: Dict[str, Any], cache: Dict[str, str]) -> str:
+        """该记忆**所属整轮**的拼接文本（不是单条消息）。
+
+        依据：22 个混淆案例里 77% 是“同一天/同一轮内多轮次混淆”，
+        只喂单条消息会让 reranker 看不到同轮的上下文。
+        """
+        rid = memory.get("request_id")
+        if not rid:
+            return (memory.get("index_text") or "")
+        if rid in cache:
+            return cache[rid]
+        text = ""
+        try:
+            rows = store.conn.execute(
+                "SELECT index_text FROM memories WHERE request_id=? ORDER BY msg_index", (rid,)
+            ).fetchall()
+            text = "\n".join((r[0] or "").strip() for r in rows if r[0]).strip()
+        except Exception:
+            text = ""
+        if not text:
+            text = (memory.get("index_text") or "")
+        cache[rid] = text
+        return text
 
     # ---------------- public ----------------
     def rerank(self, store, query_text: str, query_parts: Any,
@@ -183,15 +242,28 @@ class VLRerankClient:
             with self.lock:
                 self.stats["skipped_no_image"] += 1
             return hits
-        head, tail = hits[: self.pool], hits[self.pool:]
-        if len(head) < 2:
+        # pool 的单位是**轮**，不是消息：同一 request_id 只打一次分，得分回填整轮。
+        # 注意：输出必须保持**同样的命中集合**（契约），只是顺序按轮分重排。
+        deep = lambda m: (m.get("request_id") or m.get("id"))
+        reps, picked = [], set()
+        for item in hits:
+            rid = deep(item[0])
+            if rid in picked:
+                continue
+            if len(reps) >= self.pool:
+                break
+            picked.add(rid)
+            reps.append(item)
+        if len(reps) < 2:
             return hits
         with self.lock:
             self.stats["calls"] += 1
 
+        round_cache: Dict[str, str] = {}
+
         def work(item):
             memory = item[0]
-            doc_text = memory.get("index_text") or ""
+            doc_text = self._round_text(store, memory, round_cache)
             doc_img = self._doc_image_uri(store, memory) if self.include_doc_image else None
             key = hashlib.sha1(
                 json.dumps([self.base_url, self.model, query_text, query_images,
@@ -209,29 +281,41 @@ class VLRerankClient:
                 return None
             self._put(key, s)
             with self.lock:
+                self._margins.append(float(s))
                 self.stats["scored"] += 1
             return s
 
         try:
-            with ThreadPoolExecutor(max_workers=min(self.workers, len(head))) as ex:
-                scores = list(ex.map(work, head))
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(reps))) as ex:
+                scores = list(ex.map(work, reps))
         except Exception:
             logger.exception("vl-rerank batch failed; keeping original order")
             return hits
         if all(s is None for s in scores):
             return hits
-        base = head[0][1]
-        ranked = sorted(
-            [(m, s, pos) for pos, ((m, _), s) in enumerate(zip(head, scores))],
-            key=lambda x: (-(x[1] if x[1] is not None else -1.0), x[2]))
+
+        round_score: Dict[str, float] = {}
+        for pos, (item, sc) in enumerate(zip(reps, scores)):
+            if sc is not None:
+                round_score[deep(item[0])] = float(sc)
+        if not round_score:
+            return hits
+        base = hits[0][1]
+        # 轮序：有分的按分数降序，无分的排在其后（保持原相对顺序）
+        scored_rounds = list(round_score)
+        order = sorted(scored_rounds, key=lambda r: -round_score[r])
+        pos_of = {rid: i for i, rid in enumerate(order)}
+        fallback = len(order)
+        indexed = list(enumerate(hits))
+        indexed.sort(key=lambda t: (pos_of.get(deep(t[1][0]), fallback), t[0]))
         out, floor = [], None
-        for idx, (m, s, _pos) in enumerate(ranked):
+        for idx, (_orig, (m, _score)) in enumerate(indexed):
             val = base - 1e-6 * idx            # 保持非递增
             if floor is not None and val > floor:
                 val = floor
             out.append((m, val))
             floor = val
-        return out + list(tail)
+        return out
 
     def describe(self) -> Dict[str, Any]:
         return {"class": self.__class__.__name__, "base_url": self.base_url,

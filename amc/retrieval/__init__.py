@@ -180,6 +180,11 @@ def _maybe_wrap_llm(inner, store, settings):
         prompt_mode=getattr(settings, "llm_rerank_prompt", "round_rank"),
         timeout=float(getattr(settings, "llm_rerank_timeout", 20.0)),
     )
+    # "LLM 返回空选择"与"调用失败"分开处理（空选择=无证据信号）
+    reranker.two_stage = bool(getattr(settings, "llm_rerank_two_stage", True))
+    reranker.topk_rank = int(getattr(settings, "llm_rerank_topk_rank", 3))
+    reranker.empty_action = getattr(settings, "llm_empty_action", "keep")
+    reranker.empty_topn = int(getattr(settings, "llm_empty_topn", 3) or 3)
     gate = float(getattr(settings, "llm_rerank_gate_margin", 0.0) or 0.0)
     logger.info("[retriever] +llm_rerank model=%s pool=%d layout=%s doc_chars=%d "
                 "gate_margin=%.4f prompt=%s dedup_rounds=%s",

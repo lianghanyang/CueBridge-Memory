@@ -42,6 +42,20 @@ DEFAULT_PROMPT = (
     "Do not speculate beyond what is visible."
 )
 
+# 记忆侧图片描述（入库时用）：聊天截图**逐条转录**，其它图列产品/价格/文字。
+MEMORY_CAPTION_PROMPT = (
+    "请描述这张图片，用于后续检索。按下面两类选择其一：\n\n"
+    "【如果是聊天/对话截图】逐条转录对话：\n"
+    "- 格式 `说话人: 内容`，**严格从上到下**\n"
+    "- **右侧绿色气泡是用户本人**，说话人写 `我`；左侧用气泡上方显示的名字\n"
+    "- **顶部群名/标题不是说话人**\n"
+    "- 逐字转录，不改写、不概括、不漏句；看不清写「未知」\n\n"
+    "【如果是其它图片（产品/小票/界面/照片）】\n"
+    "- 先一句话说清主体\n"
+    "- 再列出可见的**产品名**、**价格/金额**（如 $150.00）、以及**图中所有可读文字**\n\n"
+    "只输出结果，不要解释。"
+)
+
 _DATA_URI_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.S)
 
 
@@ -124,8 +138,10 @@ class QueryImageDescriber:
                     logger.exception("query-image cache write failed")
 
     # ---------- inference ----------
-    def _caption_data_uri(self, data_uri: str) -> Optional[str]:
-        key = hashlib.sha256(data_uri.encode("utf-8")).hexdigest()
+    def _caption_data_uri(self, data_uri: str, prompt: Optional[str] = None,
+                          max_tokens: Optional[int] = None) -> Optional[str]:
+        # 缓存键要包含**提示词**：否则换了提示词仍命中旧描述（实测踩过）
+        key = hashlib.sha256(((prompt or self.prompt) + "\x00" + data_uri).encode("utf-8")).hexdigest()
         hit = self._lookup(key)
         if hit:
             with self.lock:
@@ -138,10 +154,11 @@ class QueryImageDescriber:
             data_uri = encode_data_uri(raw, "jpeg")
         except Exception:
             logger.warning("query image shrink failed; sending original")
-        body = {"model": self.model, "temperature": 0.0, "max_tokens": 160,
+        body = {"model": self.model, "temperature": 0.0,
+                "max_tokens": int(max_tokens or 160),
                 "messages": [{"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": self.prompt}]}]}
+                    {"type": "text", "text": prompt or self.prompt}]}]}
         for attempt in range(1, self.retries + 1):
             try:
                 r = self.client.post(self.base_url + "/chat/completions",
@@ -158,6 +175,30 @@ class QueryImageDescriber:
         return None
 
     # ---------- public ----------
+    def describe_memory(self, query: Any) -> str:
+        """记忆侧：用 MEMORY_CAPTION_PROMPT、更长输出，生成可检索的图片描述。"""
+        urls = extract_query_images(query, self.max_images)
+        if not urls:
+            return ""
+        outs: List[str] = []
+        for url in urls:
+            if not _DATA_URI_RE.match(url):
+                continue
+            cap = self._caption_data_uri(url, prompt=MEMORY_CAPTION_PROMPT, max_tokens=900)
+            if cap:
+                # 去掉模型回显的提示词标题行（【如果是…】）与列表前缀
+                lines = []
+                for ln in cap.splitlines():
+                    t = ln.strip()
+                    if not t or t.startswith("【") or t.startswith("规则") or t.startswith("格式"):
+                        continue
+                    t = re.sub(r"^[-*·]\s*", "", t)
+                    lines.append(t)
+                clean = " / ".join(lines).strip()
+                if clean:
+                    outs.append(clean)
+        return " ".join(outs)
+
     def describe(self, query: Any) -> str:
         """返回可并入查询文本的描述片段（无图或失败时返回空串）。"""
         urls = extract_query_images(query, self.max_images)
@@ -185,10 +226,22 @@ class QueryImageDescriber:
         return "\n".join(outs)
 
     def augment(self, text: str, query: Any) -> str:
-        """把查询图描述并回文本查询。"""
+        """把查询图描述并回文本查询。
+
+        AMC_QUERY_CAPTION_FIRST=1 时**把描述放在问题之前**（默认仍是追加）。
+        动机：TTL（test_time_learning，给图问品种/品牌）是 Gem 最弱的一类
+        （hit1 0.300 / any_gold 0.941 —— 高召回低首位，属图-文匹配问题）。
+        另一会话在 283 条 TTL 上做的离线 A/B：`q+caption` 且 caption 优先时
+        hit1_real .265 → .827（+56.2pp，CI [+49.8,+62.2]）；
+        而"base 优先、caption 补"的 union 完全不涨。所以顺序是关键变量。
+        """
+        import os as _os
         extra = self.describe(query)
         if not extra:
             return text
+        _first = (_os.getenv("AMC_QUERY_CAPTION_FIRST", "0") or "0").strip().lower() in ("1", "true", "yes")
+        if _first and text:
+            return f"[Query image] {extra}\n{text}"
         return f"{text}\n[Query image] {extra}" if text else f"[Query image] {extra}"
 
     def describe_stats(self) -> dict:

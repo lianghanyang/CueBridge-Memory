@@ -5,10 +5,10 @@
 #   cloudflared       默认。quick tunnel，**域名每次重启都变**，仅适合临时联调。
 #   serveo            免账号，但需**一次性**用浏览器注册本机 SSH 公钥后，才可固定子域。
 #                     首次连接会打印注册链接（console.serveo.net/ssh/keys?add=SHA256:…）。
-#                     用法：AMC_TUNNEL=serveo AMC_TUNNEL_SUBDOMAIN=cuebridge bash <本脚本>
-#                     注册后得到：https://cuebridge.serveo.net
+#                     用法：AMC_TUNNEL=serveo AMC_TUNNEL_SUBDOMAIN=your-domain bash <本脚本>
+#                     注册后得到：https://your-domain.serveo.net
 #   cloudflared-named 正式固定域名（需自有域名 + 一次性 `cloudflared tunnel login`）
-#                     用法：AMC_TUNNEL=cloudflared-named AMC_TUNNEL_NAME=cuebridge \
+#                     用法：AMC_TUNNEL=cloudflared-named AMC_TUNNEL_NAME=your-domain \
 #                           AMC_PUBLIC_DOMAIN=memory.example.com bash <本脚本>
 #   ngrok             需 authtoken（可选保留域名）
 #                     用法：AMC_TUNNEL=ngrok AMC_NGROK_AUTHTOKEN=xxx [AMC_NGROK_DOMAIN=xxx.ngrok-free.app]
@@ -18,7 +18,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null 2>&1 && pwd)"
 cd "${ROOT}"
 PORT="${AMC_PORT:-8000}"
 TUNNEL="${AMC_TUNNEL:-cloudflared}"
-SUB="${AMC_TUNNEL_SUBDOMAIN:-cuebridge}"
+SUB="${AMC_TUNNEL_SUBDOMAIN:-your-domain}"
 OUT_DIR="${ROOT}/data/reports/deploy"
 mkdir -p "${OUT_DIR}"
 LOG="${OUT_DIR}/tunnel.log"

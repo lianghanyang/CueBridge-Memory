@@ -450,7 +450,6 @@ class RoundFusionRetriever:
         # best_first（默认）：先在每个 budget 槽位放 *一个* round，使固定条数
         # 覆盖尽可能多的不同 request —— 这既是 request 级评测所需，也扩大了
         # rerank 池的候选多样性。轮内另一半随后补上，分数压到已输出尾部之下
-        # 以维持契约要求的非递增。
         for rpos in order:
             if len(output) >= limit:
                 return self._enforce_message_slots(output, limit)

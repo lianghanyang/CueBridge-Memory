@@ -275,7 +275,9 @@ class OpenAIEmbeddingProvider(BaseProvider):
     """DashScope compatible-mode, or vLLM --task embed."""
 
     def __init__(self, model_name, base_url, api_key="", batch=10,
-                 dim=0, instruct="", timeout=180, retries=6):
+                 dim=0, instruct="",
+                 timeout=int(__import__("os").getenv("AMC_EMBED_TIMEOUT", "15")),
+                 retries=int(__import__("os").getenv("AMC_EMBED_RETRIES", "2"))):
         import httpx
         self.model_name = model_name
         self.base_url = (base_url or "").rstrip("/")
@@ -287,10 +289,18 @@ class OpenAIEmbeddingProvider(BaseProvider):
         self.client = httpx.Client(timeout=timeout)
         logger.info("[embed:api] %s @ %s (batch=%d)", model_name, self.base_url, self.batch)
         self.failed_texts = []   # (index, text_preview, error)
-        probe = self._call(["ping"])
-        self.dim = int(probe.shape[1])
+        # 探测失败（欠费/密钥失效）时**降级**而不是崩溃：
+        # dense 腿返回空，检索退回 BM25/词法，服务仍可用。
+        try:
+            probe = self._call(["ping"])
+            self.dim = int(probe.shape[1])
+        except Exception as exc:
+            self.degraded = True
+            self.dim = int(getattr(self, "dim", 0) or 0)
+            logger.error("[embed:api] 探测失败，dense 腿降级为不可用: %s", str(exc)[:160])
         self.name = f"openai::{model_name}::d{self.dim}"
-        logger.info("[embed:api] ready dim=%d", self.dim)
+        if not getattr(self, "degraded", False):
+            logger.info("[embed:api] ready dim=%d", self.dim)
 
     def _call(self, texts):
         """Call the embeddings endpoint. Retries on transient errors.
@@ -299,7 +309,14 @@ class OpenAIEmbeddingProvider(BaseProvider):
         once, then the call fails fast. On batch failures, the caller
         should fall back to per-item calls via `_call_with_fallback`.
         """
-        payload = {"model": self.model_name, "input": list(texts),
+        texts = list(texts)
+        # 服务端批量上限（DashScope text-embedding-v4 为 20）：超过就分批
+        if len(texts) > 10:
+            out = []
+            for i in range(0, len(texts), 10):
+                out.extend(self._call(texts[i:i + 10]))
+            return out
+        payload = {"model": self.model_name, "input": texts,
                    "encoding_format": "float"}
         if self.dim:
             payload["dimensions"] = self.dim

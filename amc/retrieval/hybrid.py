@@ -24,16 +24,58 @@ class RRFHybridRetriever:
             hook(user_id, request_id)
 
     def _safe(self, retriever, user_id, query, label):
+        """**单腿失败让整题失败**：不降级，走重试。
+
+         用户决策：
+          降级（单腿返空）会**静默降低证据质量**，比 503 更糟
+          ⇒ 回滚成 re-raise，改为**在 embedding 层加重试**：
+             `AMC_EMBED_TIMEOUT` 15s→60s，`AMC_EMBED_RETRIES` 2→5。
+        """
         try:
             return retriever.search(user_id, query, self.limit)
         except Exception:
             logger.exception("[hybrid] %s leg search failed", label)
             raise
 
+    def _sparse_weight_for(self, user_id):
+        """中文用户下调词法权重。
+
+        离线实测（10 条平台真实中文查询 + 改写式中文记忆，见 scripts/zh_retrieval_probe.py）：
+            dense only          rank@1 **10/10**
+            dense + BM25(w=1.0) rank@1  **7/10**   ← 融合**拉低**了中文排序
+            w=0.1 → 10/10 | w=0.2~0.5 → 9/10 | w≥0.7 → 7/10
+        原因：中文里字符 n-gram 的区分度远低于英文词，BM25 的"弱但不为零"信号
+        会把 dense 已经正确的第一名挤下去。
+        ⇒ 语料 CJK 占比 >20% 时把 sparse 权重乘 `AMC_SPARSE_WEIGHT_CJK`（**默认 0 = 纯 dense**）。
+        """
+        w = float(self.sparse_weight)
+        # ⚠️ `self.sparse` 可能被 AnchorTimeRetriever 等包装器包住（它没有 `_index`），
+        # 原来直接调 `self.sparse._index` 抛异常后被 except 吞掉 ⇒ **权重永远不生效**。
+        # 这里沿 `base` 链向下找真正带 `_index` 的检索器。
+        obj, ratio = self.sparse, 0.0
+        for _ in range(6):
+            if obj is None:
+                break
+            fn = getattr(obj, "_index", None)
+            if fn is not None:
+                try:
+                    ratio = float((fn(user_id) or {}).get("cjk_ratio") or 0.0)
+                except Exception:
+                    ratio = 0.0
+                break
+            obj = getattr(obj, "base", None)
+        if ratio > 0.2:
+            return w * float(os.getenv("AMC_SPARSE_WEIGHT_CJK", "0.0") or 0.0)
+        return w
+
     def search(self, user_id, query, limit):
+        #   把本次的 uid/query 记在实例上，供下游 RerankPipeline / llm_rerank 的
+        #   stage_dump 关联同一次请求（否则 ce/llm 两级导出缺 uid，无法归并）。
+        self._last_uid, self._last_q = user_id, query
         fused, objects = {}, {}
+        _sw = self._sparse_weight_for(user_id)
         for weight, hits in (
-            (self.sparse_weight, self._safe(self.sparse, user_id, query, "sparse")),
+            (_sw, self._safe(self.sparse, user_id, query, "sparse")),
             (self.dense_weight, self._safe(self.dense, user_id, query, "dense")),
         ):
             for rank, (memory, _) in enumerate(hits, start=1):
@@ -41,7 +83,14 @@ class RRFHybridRetriever:
                 objects[key] = memory
                 fused[key] = fused.get(key, 0.0) + weight / (self.rrf_k + rank)
         ranked = sorted(fused.items(), key=lambda item: item[1], reverse=True)
-        return [(objects[key], float(score)) for key, score in ranked[:limit]]
+        _out = [(objects[key], float(score)) for key, score in ranked[:limit]]
+        #   导出 **RRF 融合后、本地 cross-encoder 之前** 的排序。
+        try:
+            from amc import stage_dump as _sd
+            _sd.dump("fused", _out, uid=user_id, q=query)
+        except Exception:
+            pass
+        return _out
 
     def describe(self):
         return {
@@ -129,6 +178,23 @@ class RerankPipeline:
                 head_for_ce = head
         try:
             reranked = self.reranker.rerank(query, head_for_ce, top_k=len(head_for_ce))
+            try:
+                from amc import stage_dump as _sd
+                # ⚠️ ：**ce 阶段要导出"重排后的完整列表"**。
+                #   原来只导出 reranked（= head 的 30 条）⇒ R@100 被当成"只有 30 条"
+                #   ⇒ 表格里 ce 的 R@100=68% 是假低（实为 R@30）。
+                #   这里把 reranked 与其后的 tail（未进 CE 的候选）按原顺序拼接，
+                #   让 R@n 的 n 与最终链路可比。
+                _ce_ids = [(m, s) for m, s in reranked]
+                try:
+                    _seen_ce = {str(m.get("id")) for m, _ in _ce_ids}
+                    _tail_ce = [(m, s) for m, s in (tail or []) if str(m.get("id")) not in _seen_ce]
+                except Exception:
+                    _tail_ce = []
+                _sd.dump("ce", _ce_ids + _tail_ce,
+                         uid=getattr(self.base, "_last_uid", None), q=query)
+            except Exception:
+                pass
         except Exception as exc:
             # 严格遵循“重新部署而非退化”原则：
             # 当 GPU 发生致命错误时，绝不吞掉异常默默退化为 base 检索结果，

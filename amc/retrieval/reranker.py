@@ -44,6 +44,16 @@ class Qwen3Reranker:
         self.device = pick_device(device)
         self.dtype = resolve_dtype(dtype, self.device)
         self.batch = max(1, batch)
+        # ---- 跨请求批处理（把并发请求的候选合并成一次 forward）----
+        import os as _os, queue as _q
+        self._batching = (_os.getenv("AMC_RERANK_BATCHING", "1") or "1") not in ("0", "false", "False")
+        self._collect_ms = float(_os.getenv("AMC_RERANK_COLLECT_MS", "8") or 8) / 1000.0
+        self._max_batch = int(_os.getenv("AMC_RERANK_MAX_BATCH", "96") or 96)
+        self._bq = _q.Queue()
+        self._coalesced = 0     # 被合并进同一批的次数（统计用）
+        self._forward_calls = 0  # forward 调用次数（统计用）
+        if self._batching:
+            threading.Thread(target=self._collect_loop, daemon=True).start()
         self.max_length = max_length
         self.instruct = instruct or "Given a query, judge document relevance"
         self.model_name = model_name
@@ -113,6 +123,55 @@ class Qwen3Reranker:
             mid = len(texts) // 2
             return self._score(texts[:mid]) + self._score(texts[mid:])
 
+    def _collect_loop(self):
+        """把短时间内到达的多个请求合并成一次 forward（GPU 吞吐关键）。"""
+        while True:
+            item = self._bq.get()
+            batch = [item]
+            deadline = time.time() + self._collect_ms
+            total = len(item[0])
+            while total < self._max_batch:
+                timeout = deadline - time.time()
+                if timeout <= 0:
+                    break
+                try:
+                    nxt = self._bq.get(timeout=timeout)
+                except Exception:
+                    break
+                if total + len(nxt[0]) > self._max_batch:
+                    self._bq.put(nxt)      # 放回去，留给下一轮
+                    break
+                batch.append(nxt)
+                total += len(nxt[0])
+            if len(batch) > 1:
+                self._coalesced += len(batch) - 1
+            texts, spans = [], []
+            for t, _ev, _out in batch:
+                spans.append((len(texts), len(texts) + len(t)))
+                texts.extend(t)
+            try:
+                self._forward_calls += 1
+                scores = self._score(texts)
+            except Exception as exc:
+                for _t, ev, out in batch:
+                    out["err"] = exc
+                    ev.set()
+                continue
+            for (a, b), (_t, ev, out) in zip(spans, batch):
+                out["scores"] = scores[a:b]
+                ev.set()
+
+    def _score_batched(self, texts):
+        if not self._batching:
+            return self._score(texts)
+        ev = threading.Event()
+        out = {}
+        self._bq.put((list(texts), ev, out))
+        ev.wait()
+        if "err" in out:
+            raise out["err"]
+        return out["scores"]
+
     def rerank(self, query, candidates, top_k):
         if not candidates:
             return []
@@ -120,7 +179,7 @@ class Qwen3Reranker:
         texts = self._pairs(query, memories)
         scores = []
         for start in range(0, len(texts), self.batch):
-            scores.extend(self._score(texts[start:start + self.batch]))
+            scores.extend(self._score_batched(texts[start:start + self.batch]))
 
         bad = [i for i, s in enumerate(scores) if not math.isfinite(s)]
         if bad and self.batch > 1:
@@ -148,6 +207,9 @@ class Qwen3Reranker:
             "device": self.device,
             "dtype": dtype_name(self.dtype),
             "nan_count": self.nan_count,
+            "batching": bool(getattr(self, "_batching", False)),
+            "coalesced": int(getattr(self, "_coalesced", 0)),
+            "forward_calls": int(getattr(self, "_forward_calls", 0)),
             "oom_splits": self.oom_splits,
         }
 
@@ -161,6 +223,16 @@ class VLLMGenerativeReranker:
         self.model = model
         self.api_key = api_key
         self.batch = max(1, batch)
+        # ---- 跨请求批处理（把并发请求的候选合并成一次 forward）----
+        import os as _os, queue as _q
+        self._batching = (_os.getenv("AMC_RERANK_BATCHING", "1") or "1") not in ("0", "false", "False")
+        self._collect_ms = float(_os.getenv("AMC_RERANK_COLLECT_MS", "8") or 8) / 1000.0
+        self._max_batch = int(_os.getenv("AMC_RERANK_MAX_BATCH", "96") or 96)
+        self._bq = _q.Queue()
+        self._coalesced = 0     # 被合并进同一批的次数（统计用）
+        self._forward_calls = 0  # forward 调用次数（统计用）
+        if self._batching:
+            threading.Thread(target=self._collect_loop, daemon=True).start()
         self.max_tokens = max_tokens
         self.retries = retries
         self.instruct = instruct
@@ -203,6 +275,55 @@ class VLLMGenerativeReranker:
                 logger.warning("[rerank:vllm] attempt %d failed: %s", attempt, exc)
                 time.sleep(1)
         return None
+
+    def _collect_loop(self):
+        """把短时间内到达的多个请求合并成一次 forward（GPU 吞吐关键）。"""
+        while True:
+            item = self._bq.get()
+            batch = [item]
+            deadline = time.time() + self._collect_ms
+            total = len(item[0])
+            while total < self._max_batch:
+                timeout = deadline - time.time()
+                if timeout <= 0:
+                    break
+                try:
+                    nxt = self._bq.get(timeout=timeout)
+                except Exception:
+                    break
+                if total + len(nxt[0]) > self._max_batch:
+                    self._bq.put(nxt)      # 放回去，留给下一轮
+                    break
+                batch.append(nxt)
+                total += len(nxt[0])
+            if len(batch) > 1:
+                self._coalesced += len(batch) - 1
+            texts, spans = [], []
+            for t, _ev, _out in batch:
+                spans.append((len(texts), len(texts) + len(t)))
+                texts.extend(t)
+            try:
+                self._forward_calls += 1
+                scores = self._score(texts)
+            except Exception as exc:
+                for _t, ev, out in batch:
+                    out["err"] = exc
+                    ev.set()
+                continue
+            for (a, b), (_t, ev, out) in zip(spans, batch):
+                out["scores"] = scores[a:b]
+                ev.set()
+
+    def _score_batched(self, texts):
+        if not self._batching:
+            return self._score(texts)
+        ev = threading.Event()
+        out = {}
+        self._bq.put((list(texts), ev, out))
+        ev.wait()
+        if "err" in out:
+            raise out["err"]
+        return out["scores"]
 
     def rerank(self, query, candidates, top_k):
         if not candidates:

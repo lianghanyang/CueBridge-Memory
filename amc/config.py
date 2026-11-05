@@ -3,9 +3,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MIB = 1024 * 1024
-MAX_SINGLE_IMAGE = 10 * MIB
-MAX_ADD_IMAGES = 30 * MIB
-MAX_SEARCH_IMAGES = 30 * MIB
+#   理由：多模态题没有图就答不了 ⇒ 宁可多占资源，也不要因为"图太大"把整块记忆丢掉。
+#   实测今天有 44 次"真实数据块"（含 12.5 MB body）因图片超限被拒 ⇒ 数据已不可恢复。
+#   需要限制时用环境变量调回：AMC_MAX_SINGLE_IMAGE_MIB / AMC_MAX_ADD_IMAGES_MIB
+MAX_SINGLE_IMAGE = int((os.getenv("AMC_MAX_SINGLE_IMAGE_MIB", "512") or 512)) * MIB
+MAX_ADD_IMAGES = int((os.getenv("AMC_MAX_ADD_IMAGES_MIB", "2048") or 2048)) * MIB
+# 每响应图片总预算。原来是 3MiB（假设图片被压到 40-80KB/张）。
+# 平台规范：单响应图片合计 ≤30MiB ⇒ 取 20MiB 留余量。
+MAX_SEARCH_IMAGES = int((__import__("os").getenv("AMC_SEARCH_IMAGES_MIB", "20") or 20)) * MIB
 
 DASHSCOPE_COMPATIBLE_URL = (
     "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -127,13 +132,26 @@ class Settings:
     relation_select_pairwise: bool = True
     relation_select_requires_query_image: bool = True
     relation_select_cache_path: str = ""
+    # 记忆侧图片描述：入库时用 gpt-4o-mini 视觉生成描述并写入索引文本
+    # （进向量层的仍只有文本，Embedding 仍为 text-embedding-v4；比赛合规）
+    image_caption: bool = False
+    # 多模态证据选择：查询带图时，用「查询图 + 候选图片」让 gpt-4o-mini 判定哪张图承载答案（默认关）
+    multimodal_select: bool = False
+    multimodal_select_pool: int = 4
+    multimodal_select_max_side: int = 512
     vl_rerank: bool = False
+    # True 时先跑 VL rerank，再让 relation_select 在其结果上工作（默认 False=rs 优先）
+    vl_rerank_first: bool = False
     vl_rerank_base_url: str = ""
     vl_rerank_model: str = "Qwen3-VL-Reranker-8B"
-    vl_rerank_pool: int = 5
+    # 5 -> 8：离线 150 条样本里 6% 的 gold 不在 top-5 轮内（召回天花板）
+    vl_rerank_pool: int = 8
     vl_rerank_timeout: float = 60.0
     vl_rerank_workers: int = 8
-    vl_rerank_include_doc_image: bool = False
+    # 487 条真实查询图配对验证：加候选图 R@1 +0.0183 [+0.0049,+0.0326] ✅
+    # provenance（默认）：判"文档里的图是否就是被问的那张"；relevance：旧行为
+    vl_rerank_instruct: str = "provenance"
+    vl_rerank_include_doc_image: bool = True
     vl_rerank_requires_query_image: bool = True
     vl_rerank_max_query_images: int = 1
     vl_rerank_cache_path: str = ""
@@ -144,6 +162,12 @@ class Settings:
     # LLM 档提示：round_rank=产线原提示（排序）| evidence_set=集合级多选
     # 实测（S1_S6_REPORT.md §2/§3）：evidence_set 必须配合门控才为正。
     llm_rerank_prompt: str = "round_rank"
+    # 两段式：先 evidence_set 选集合，再 round_rank 对该集合排序
+    llm_rerank_two_stage: bool = True
+    llm_rerank_topk_rank: int = 3
+    # LLM 返回空选择时的行为：keep=保持4B排序（默认）/ truncate=只留 topN / empty=返回空
+    llm_empty_action: str = "keep"
+    llm_empty_topn: int = 3
     # 若查询文本含该标记则**跳过 LLM 档**（image 路已有自己的关系选择档，且 LLM 档在该路实测为负：
     # T4：4B→LLM 改对 61 / 改错 95）。设成 "[Query image]" 即可只在 text 路启用。
     llm_rerank_skip_marker: str = ""
@@ -155,8 +179,53 @@ class Settings:
     # Search 响应里 content 的形态：text=压平成字符串（默认，兼容性最好）；
     # parts=按 AML 规范返回 ContentPart[]（含图片时有用）。契约两种都允许。
     search_content_format: str = "text"
+    # 多模态：每个 search 响应最多带几张图（配合缩放，避免响应过大）
+    search_max_images: int = 10
+    # 头部会话多样性：前 head_size 条内每会话最多 head_cap 条（0=关闭）
+    # 通用 abstention 门控：top-1 分数低于该值时返回空数组（0=关闭）
+    # 轮级返回：同轮只出一条（content=整轮拼接），top-10 覆盖 10 个不同的轮
+    round_items: bool = True
+    # 轮级 content 的最大字符数（0=不限）：避免答案端截断丢失关键句
+    round_text_max_chars: int = 0
+    # 返回轮级文本时去掉 "Image Caption:" 描述（图仍以 parts 返回），显著减小答案端上下文
+    round_strip_caption: bool = True
+    abstain_gate_eps: float = 0.0
+    # 独立于 agent 的"顶部分数过低 → 返回空"门控（官方数据双峰，0.1 可分开）
+    abstain_topk_score: float = 0.0
+    # 低分时再做词法复核：返回轮里出现 ≥2 个查询关键词则不拒答
+    abstain_sentinel: bool = True
+    abstain_calibrator: bool = False
+    profile_enabled: bool = False
+    profile_db_path: str = ""
+    library_enabled: bool = False
+    abstain_lexical: bool = True
+    # 低分时用 LLM 判"这些轮里有没有答案"（比词法更准）
+    abstain_llm: bool = True
+    abstain_judge_window: int = 30
+    abstain_judge_chars: int = 350
+    # 聚合题（how much/一共/总共）是否豁免拒答判定（判官难验证"总数"）
+    abstain_aggregate_exempt: bool = True
+    # 判官触发上限：top1 < 该值就调判官（覆盖 0.1~0.5 的"高分拒答"盲区）
+    abstain_judge_high: float = 0.0
+    # 低分时是否允许判官"捞回"（逐字摘句；默认关，实测无收益）
+    abstain_rescue: bool = False
+    head_session_cap: int = 0
+    head_size: int = 10
     # LLM 档单次调用超时（秒）：超时即退化为内层 4B 排序，绝不拖垮 /search
     llm_rerank_timeout: float = 20.0
+    # Agent 检索流程：门控 → 调度 → 按类检索 → 证据校验
+    agent_retrieval: bool = False
+    agent_max_extra: int = 2
+    agent_gate_eps: float = 0.005
+    agent_llm_base_url: str = ""
+    agent_llm_api_key: str = ""
+    agent_llm_model: str = ""
+    # classify=先判题型再检索；expand=只做查询扩展+校验驱动（推荐）
+    agent_mode: str = "expand"
+    agent_max_rounds: int = 1
+    agent_abstain: bool = False
+    agent_abstain_score: float = 0.0
+    agent_trace: str = ""
     llm_rerank: bool = False
     llm_rerank_base_url: str = ""
     llm_rerank_api_key: str = ""
@@ -243,6 +312,22 @@ class Settings:
             or os.getenv("DASHSCOPE_API_KEY", "").strip()
         )
 
+        llm_base_url = (
+            os.getenv("AMC_LLM_RERANK_BASE_URL", "").strip()
+            or os.getenv("OPENAI_BASE_URL", "").strip()
+            or os.getenv("AMC_EMBEDDING_BASE_URL", "").strip()
+        )
+        llm_api_key = (
+            os.getenv("AMC_LLM_RERANK_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+            or os.getenv("AMC_EMBEDDING_API_KEY", "").strip()
+        )
+        llm_model = (
+            os.getenv("AMC_LLM_RERANK_MODEL", "").strip()
+            or os.getenv("OPENAI_MODEL", "").strip()
+            or "gpt-4o-mini"
+        )
+
         return cls(
             db_path=Path(os.getenv("AMC_DB_PATH", "./data/store/memory.db")),
             blob_dir=Path(os.getenv("AMC_BLOB_DIR", "./data/store/blobs")),
@@ -281,7 +366,7 @@ class Settings:
             reranker_candidates=env_int("AMC_RERANKER_CANDIDATES", 30),
             reranker_base_url=os.getenv(
                 "AMC_RERANKER_BASE_URL",
-                os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8002/v1"),
+                os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000"),
             ),
             reranker_api_key=os.getenv(
                 "AMC_RERANKER_API_KEY",
@@ -323,13 +408,19 @@ class Settings:
             relation_select_requires_query_image=env_bool(
                 "AMC_RELATION_SELECT_REQUIRES_IMAGE", True),
             relation_select_cache_path=os.getenv("AMC_RELATION_SELECT_CACHE", ""),
+            image_caption=env_bool("AMC_IMAGE_CAPTION", False),
+            multimodal_select=env_bool("AMC_MULTIMODAL_SELECT", False),
+            multimodal_select_pool=env_int("AMC_MULTIMODAL_SELECT_POOL", 4),
+            multimodal_select_max_side=env_int("AMC_MULTIMODAL_SELECT_MAX_SIDE", 512),
             vl_rerank=env_bool("AMC_VL_RERANK", False),
+            vl_rerank_first=env_bool("AMC_VL_RERANK_FIRST", False),
             vl_rerank_base_url=os.getenv("AMC_VL_RERANK_BASE_URL", ""),
             vl_rerank_model=os.getenv("AMC_VL_RERANK_MODEL", "Qwen3-VL-Reranker-8B"),
-            vl_rerank_pool=env_int("AMC_VL_RERANK_POOL", 5),
+            vl_rerank_pool=env_int("AMC_VL_RERANK_POOL", 8),
             vl_rerank_timeout=float(os.getenv("AMC_VL_RERANK_TIMEOUT", "60")),
             vl_rerank_workers=env_int("AMC_VL_RERANK_WORKERS", 8),
-            vl_rerank_include_doc_image=env_bool("AMC_VL_RERANK_DOC_IMAGE", False),
+            vl_rerank_include_doc_image=env_bool("AMC_VL_RERANK_DOC_IMAGE", True),
+            vl_rerank_instruct=os.getenv("AMC_VL_RERANK_INSTRUCT", "provenance"),
             vl_rerank_requires_query_image=env_bool("AMC_VL_RERANK_REQUIRES_IMAGE", True),
             vl_rerank_max_query_images=env_int("AMC_VL_RERANK_MAX_QUERY_IMAGES", 1),
             vl_rerank_cache_path=os.getenv("AMC_VL_RERANK_CACHE", ""),
@@ -347,21 +438,50 @@ class Settings:
             query_vision_cache_path=os.getenv("AMC_QUERY_VISION_CACHE", ""),
             llm_rerank_gate_margin=float(os.getenv("AMC_LLM_RERANK_GATE_MARGIN", "0")),
             llm_rerank_prompt=os.getenv("AMC_LLM_RERANK_PROMPT", "round_rank"),
+            llm_rerank_two_stage=env_bool("AMC_LLM_RERANK_TWO_STAGE", True),
+            llm_rerank_topk_rank=int(os.getenv("AMC_LLM_RERANK_TOPK_RANK", "3")),
+            llm_empty_action=os.getenv("AMC_LLM_EMPTY_ACTION", "keep").strip().lower(),
+            llm_empty_topn=env_int("AMC_LLM_EMPTY_TOPN", 3),
             llm_rerank_skip_marker=os.getenv("AMC_LLM_RERANK_SKIP_MARKER", ""),
             llm_rerank_dedup_rounds=env_bool("AMC_LLM_RERANK_DEDUP_ROUNDS", True),
             search_content_format=os.getenv("AMC_SEARCH_CONTENT_FORMAT", "text").strip().lower(),
+            search_max_images=env_int("AMC_SEARCH_MAX_IMAGES", 10),
+            head_session_cap=env_int("AMC_HEAD_SESSION_CAP", 0),
+            abstain_gate_eps=float(os.getenv("AMC_ABSTAIN_GATE_EPS", "0.0") or 0.0),
+            abstain_topk_score=float(os.getenv("AMC_ABSTAIN_TOPK_SCORE", "0.0") or 0.0),
+            abstain_lexical=env_bool("AMC_ABSTAIN_LEXICAL", True),
+            abstain_sentinel=env_bool("AMC_ABSTAIN_SENTINEL", True),
+            abstain_calibrator=env_bool("AMC_ABSTAIN_CALIBRATOR", False),
+            profile_enabled=env_bool("AMC_PROFILE", False),
+            profile_db_path=os.getenv("AMC_PROFILE_DB", ""),
+            library_enabled=env_bool("AMC_LIBRARY", False),
+            abstain_llm=env_bool("AMC_ABSTAIN_LLM", True),
+            abstain_judge_window=env_int("AMC_ABSTAIN_JUDGE_WINDOW", 30),
+            abstain_judge_chars=env_int("AMC_ABSTAIN_JUDGE_CHARS", 350),
+            abstain_aggregate_exempt=env_bool("AMC_ABSTAIN_AGGREGATE_EXEMPT", True),
+            abstain_judge_high=float(os.getenv("AMC_ABSTAIN_JUDGE_HIGH", "0.0") or 0.0),
+            abstain_rescue=env_bool("AMC_ABSTAIN_RESCUE", False),
+            round_items=env_bool("AMC_ROUND_ITEMS", True),
+            round_text_max_chars=env_int("AMC_ROUND_TEXT_MAX_CHARS", 0),
+            round_strip_caption=env_bool("AMC_ROUND_STRIP_CAPTION", True),
+            head_size=env_int("AMC_HEAD_SIZE", 10),
             llm_rerank_timeout=float(os.getenv("AMC_LLM_RERANK_TIMEOUT", "20")),
+            agent_retrieval=env_bool("AMC_AGENT_RETRIEVAL", False),
+            agent_max_extra=env_int("AMC_AGENT_MAX_EXTRA", 2),
+            agent_gate_eps=float(os.getenv("AMC_AGENT_GATE_EPS", "0.005") or 0.005),
+            agent_llm_base_url=os.getenv("AMC_AGENT_LLM_BASE_URL", "").strip(),
+            agent_llm_api_key=os.getenv("AMC_AGENT_LLM_API_KEY", "").strip(),
+            agent_llm_model=os.getenv("AMC_AGENT_LLM_MODEL", "").strip(),
+            agent_mode=os.getenv("AMC_AGENT_MODE", "expand").strip().lower(),
+            agent_max_rounds=env_int("AMC_AGENT_MAX_ROUNDS", 1),
+            agent_abstain=env_bool("AMC_AGENT_ABSTAIN", False),
+            agent_abstain_score=float(os.getenv("AMC_AGENT_ABSTAIN_SCORE", "0.0") or 0.0),
+            agent_trace=os.getenv("AMC_AGENT_TRACE", "").strip(),
             llm_rerank=env_bool("AMC_LLM_RERANK", False),
-            # 比赛要求 LLM 相关组件用 gpt-4o-mini（Reranker 不限）。
             # 密钥回退链：AMC_LLM_RERANK_API_KEY -> OPENAI_API_KEY -> 嵌入用的 key。
-            llm_rerank_base_url=os.getenv("AMC_LLM_RERANK_BASE_URL",
-                                          os.getenv("OPENAI_BASE_URL",
-                                                    os.getenv("AMC_EMBEDDING_BASE_URL", ""))),
-            llm_rerank_api_key=os.getenv("AMC_LLM_RERANK_API_KEY",
-                                         os.getenv("OPENAI_API_KEY",
-                                                   os.getenv("AMC_EMBEDDING_API_KEY", ""))),
-            llm_rerank_model=os.getenv("AMC_LLM_RERANK_MODEL",
-                                       os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            llm_rerank_base_url=llm_base_url,
+            llm_rerank_api_key=llm_api_key,
+            llm_rerank_model=llm_model,
             llm_rerank_pool=env_int("AMC_LLM_RERANK_POOL", 30),
             llm_rerank_layout=os.getenv("AMC_LLM_RERANK_LAYOUT", "round").strip().lower(),
             llm_rerank_doc_chars=env_int("AMC_LLM_RERANK_DOC_CHARS", 1400),
@@ -371,6 +491,7 @@ class Settings:
             rrf_k=env_int("AMC_RRF_K", 60),
             dense_weight=env_float("AMC_DENSE_WEIGHT", 1.0),
             sparse_weight=env_float("AMC_SPARSE_WEIGHT", 1.0),
+            rerank_unit=os.getenv("AMC_RERANK_UNIT", "round").strip().lower(),
             round_leg=env_bool("AMC_ROUND_LEG", False),
             round_rrf_k=env_int("AMC_ROUND_RRF_K", 20),
             round_weight=env_float("AMC_ROUND_WEIGHT", 1.0),

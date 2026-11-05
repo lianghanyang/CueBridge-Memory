@@ -24,6 +24,7 @@ class DenseRetriever:
         self.warm_batch = max(1, warm_batch)
         self.cache = VectorCache(cache_path, namespace=provider.name, dim=provider.dim)
         self.index_cache = OrderedDict()
+        self._idx_stats = {"build_total": 0, "build_by_version": 0, "hit": 0, "skipped_by_debounce": 0}
         self.index_lock = threading.RLock()
         self.stats = {"encoded": 0, "rejected": 0, "warm_batches": 0}
         self._query_memo = OrderedDict()
@@ -44,9 +45,35 @@ class DenseRetriever:
                 for part in memory.get("content", [])
                 if isinstance(part, dict) and part.get("type") == "text"
             )
+        # ⚠️ caption 必须在**开头**：embedding 侧会按 max_chars 截断，
+        # 而 caption 原本是追加在文本尾部的 —— 长记录里它会被截掉，
+        # 导致"向量里看不见图"，而这类记录恰好是图像题（TTL）的全部证据。
+        # 实测（ATM）：caption 追加位置中位 1331 字，P90 更高；截断 4000 时相当一部分被砍。
+        # 这里在**构索引时**把 [Image ...] 段提到最前，不需要改存储格式，对所有历史记录同样生效。
         if memory.get("n_images"):
+            import re as _re
+            # **只在会截断时才重排** —— 否则所有含图记录的 key 都会变，
+            # 导致全量重新 embedding（Gem 的 caption 实验也会被污染）。
+            # 判据：caption 段的结束位置是否超过 max_chars。
+            _caps = _re.findall(r"\[Image [^\]]+\][^\n]*", text)
+            if _caps:
+                _last_end = max(text.rfind(_c) + len(_c) for _c in _caps)
+                if _last_end > min(max_chars, 10000):
+                    _rest = text
+                    for _c in _caps:
+                        _rest = _rest.replace(_c, "", 1)
+                    text = "\n".join(_caps) + "\n" + _rest.strip()
             text = f"{text}\n[contains {memory['n_images']} image(s)]"
-        return text[:min(max_chars, 10000)] if text else "[empty memory]"
+        # 截断策略：
+        #   max_chars > 0 → 按字符截断（旧行为）
+        #   max_chars == 0 → **不截断**（只保留一个防病态输入的硬上限）
+        # 为什么允许不截断：ATM 的记录最长 10,483 字符，而 text-embedding-v4 上限 8192 token
+        # （中文≈1字/token，英文≈0.25 token/字）⇒ 10k 字符远未超限。
+        # 而截断会让尾部信息（尤其是追加的图 caption）丢失，实测 ATM 有 26% 受影响。
+        if not text:
+            return "[empty memory]"
+        _cap = int(max_chars) if max_chars and int(max_chars) > 0 else 32000
+        return text[:_cap]
 
     # ---------- encode with cache ----------
     def _ensure(self, texts, reason="index"):
@@ -123,10 +150,28 @@ class DenseRetriever:
             cached = self.index_cache.get(user_id)
             if cached and cached["version"] == version:
                 self.index_cache.move_to_end(user_id)
+                self._idx_stats["hit"] = self._idx_stats.get("hit", 0) + 1
                 return cached
 
+        # ---- debounce（⚠️ 已验证无用，默认关闭；见 data/reports/library/OPERATIONS.md）----
+        # 稠密索引的重建成本远高于 BM25（要重新算 embedding），所以这里收益更大。
+        import os as _os, time as _t
+        if cached:
+            _db = float(_os.getenv("AMC_INDEX_DEBOUNCE_SEC", "0") or "0")
+            _maxd = int(_os.getenv("AMC_INDEX_DEBOUNCE_MAX_DELTA", "50") or "50")
+            if _db > 0:
+                _age = _t.time() - float(cached.get("built_at") or 0)
+                _cur = self.store.count_memories(user_id)
+                _delta = _cur - len(cached.get("memories") or [])
+                if _age < _db and 0 <= _delta <= _maxd:
+                    self._idx_stats["skipped_by_debounce"] = self._idx_stats.get("skipped_by_debounce", 0) + 1
+                    return cached
+
         memories = self.store.list_memories(user_id)
-        result = {"version": version, "memories": memories, "matrix": None}
+        self._idx_stats["build_total"] = self._idx_stats.get("build_total", 0) + 1
+        if cached:
+            self._idx_stats["build_by_version"] = self._idx_stats.get("build_by_version", 0) + 1
+        result = {"version": version, "memories": memories, "matrix": None, "built_at": _t.time()}
         if memories:
             texts = [self._doc_text(memory, self.max_chars) for memory in memories]
             keys, found = self._ensure(texts, reason="index")
@@ -134,6 +179,17 @@ class DenseRetriever:
             result["matrix"] = np.vstack(
                 [found.get(key, zero) for key in keys]
             ).astype(np.float32, copy=False)
+            # ⚠️ 缺失 embedding 的记录被补成**零向量**：它们对稠密检索永久不可见
+            # （score 恒为 0，被 min_score 过滤），但不会报错 —— 典型的静默召回损失。
+            # 这里把"有多少行是零向量"记下来并暴露到 /health，
+            # 让"零向量"这种隐形降级可被发现（对应 OPERATIONS.md 的可观测性清单）。
+            _missing = sum(1 for k in keys if k not in found)
+            result["zero_rows"] = int(_missing)
+            self._idx_stats["zero_rows"] = int(_missing)
+            if _missing:
+                logger.warning("[dense] 用户 %s 缺 embedding %d/%d 条（零向量，对 dense 不可见）",
+                               user_id, _missing, len(keys))
+                self._idx_stats.setdefault("zero_by_user", {})[user_id] = int(_missing)
 
         with self.index_lock:
             self.index_cache[user_id] = result
@@ -156,8 +212,13 @@ class DenseRetriever:
             if cached is not None:
                 self._query_memo.move_to_end(query)
                 return cached
+        # ⚠️ `max_chars == 0` 表示"不截断"（见 _doc_text）。这里必须同样处理：
+        # 否则 `query[:0]` 会得到**空串** → 查询向量变成空串的嵌入 → dense 全乱。
+        # （2026-10-31 自查发现：我把 AMC_EMBEDDING_MAX_CHARS 设成 0 后，
+        #   离线端到端测试的 rank@1 从 10/10 掉到 1/10，就是这个原因。）
+        _qm = int(self.max_chars) if self.max_chars and int(self.max_chars) > 0 else 32000
         vector = np.asarray(
-            self.provider.encode_query(query[:self.max_chars]), dtype=np.float32
+            self.provider.encode_query(query[:_qm]), dtype=np.float32
         ).ravel()
         if not finite_rows(vector)[0]:
             logger.warning("[dense] query vector non-finite, dense leg skipped")
