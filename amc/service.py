@@ -1822,8 +1822,9 @@ class MemoryService:
                 # 而 content 里出现 image_ref（非 text/image_url）会被答案端判为非法格式（实测 HTTP 400）。
                 if _max_i <= 0:
                     _max_i = 10 ** 6
-                # 体积预算按 base64 后估算：原始字节 × 4/3（base64 膨胀）⇒ 20 MiB 原始 ≈ 27 MB JSON
-                # 依据：契约限制是**响应 JSON ≤30 MiB**，不是原始图片字节之和
+                # 体积预算按**原始图片字节**计（`_used` 累加 len(_raw)），而契约限制的是
+                # "响应 JSON ≤30 MiB"，base64 膨胀约 4/3 ⇒ 取值应按 `30 / 1.37 ≈ 21` 定，
+                # 才能保证 JSON < 30 MB（当前 .env.prod 用 21）。
                 _cap_total = int(float(os.getenv("AMC_RETURN_IMAGES_MIB", "20") or 20) * 1024 * 1024)
                 _cap_single = int(8.0 * 1024 * 1024)
                 _n_i, _used = 0, 0
@@ -1857,66 +1858,18 @@ class MemoryService:
                                                     "caption": _p2.get("caption") or ""})
                     except Exception:
                         logger.warning("[images] 按轮次补图失败（忽略）", exc_info=True)
-                # ---- 线索优先排序（规格见 reviewer ）----------------
-                #   目的：interleave 之后"图跟着它的 caption"，但 10 张上限仍会
-                #   把"题面要的那张"挤掉（实证 h02：wider view 在 msg#14，被前 10 张占满）。
-                #   做法：对**每条带图消息**打分，优先物化高分（命中题面线索）的图。
-                #   score = 3×(线索词命中) + 2×(题面实体/数字重合，封顶 3) + 1×(user 发言)
-                _CUES = ("wider view", "wider shot", "wider", "close-up", "close up",
-                         "same test", "same spot", "different angle", "overview",
-                         "comparison", "first paint setup", "全景", "近景", "特写",
-                         "同一个位置", "对比图", "最后一张", "第一张")
-                _q_txt = ""
-                try:
-                    _q_txt = str(_deep_query or getattr(_DECISION, "q", "") or "")
-                except Exception:
-                    _q_txt = ""
-                _qlow = _q_txt.lower()
-                _q_ents = set()
-                try:
-                    import re as _re_cue
-                    for _w in _re_cue.findall(r"[0-9]+(?:\.[0-9]+)?%?|[A-Za-z]{4,}", _q_txt):
-                        _q_ents.add(str(_w).lower())
-                except Exception:
-                    pass
-                _cands = []          # (score, rec_idx, part_idx, msg_idx_hint)
-                _cue_hit_any = False
+                # 线索优先已移除（用户 ）：
+                #   实测"按消息原样返回（interleave）"已足够；线索打分增加复杂度却收益不明确
+                #   ⇒ 改回"按记录/part 自然顺序物化"。
+                _cands = []
                 for _ri, _r2 in enumerate(out):
                     _c2 = _r2.get("content")
                     if not isinstance(_c2, list):
                         continue
                     for _pi, _pt in enumerate(_c2):
-                        if not (isinstance(_pt, dict) and _pt.get("type") == "image_ref"):
-                            continue
-                        _prev = ""
-                        for _pj in range(_pi - 1, -1, -1):
-                            _pp = _c2[_pj]
-                            if isinstance(_pp, dict) and _pp.get("type") == "text":
-                                _prev = str(_pp.get("text") or "")
-                                break
-                        _pl = _prev.lower()
-                        _sc = 0
-                        _hit = [c for c in _CUES if c in _pl]
-                        if _hit:
-                            _sc += 3
-                            _cue_hit_any = True
-                        _ov = sum(1 for e in _q_ents if e and e in _pl)
-                        _sc += 2 * min(3, _ov)
-                        if "user" in _prev[:40].lower():
-                            _sc += 1
-                        _cands.append((_sc, _ri, _pi, _hit))
-                if _cue_hit_any:
-                    _pos = [c for c in _cands if c[0] > 0]
-                    _neg = [c for c in _cands if c[0] <= 0]
-                    _pos.sort(key=lambda x: (-x[0], x[1], x[2]))
-                    _cands = _pos + _neg
-                    _top = _pos[0] if _pos else None
-                    if _top:
-                        logger.info("[images] 线索优先：cues=%s 命中 记录#%d/part#%d(score=%d) ⇒ 先物化",
-                                    _top[3][:3], _top[1], _top[2], _top[0])
-                else:
-                    _cands.sort(key=lambda x: (x[1], x[2]))
-                    logger.info("[images] 无线索命中 ⇒ 回退顺序物化 前 %d 张", _max_i)
+                        if isinstance(_pt, dict) and _pt.get("type") == "image_ref":
+                            _cands.append((0, _ri, _pi, []))
+                logger.info("[images] 按顺序物化（线索优先已移除）：候选 %d 张，上限 %d", len(_cands), _max_i)
                 # ---- 按排序后的候选物化 -----------------------------------------
                 for _sc, _ri, _pi, _hit in _cands:
                     if _n_i >= _max_i:
@@ -1945,10 +1898,15 @@ class MemoryService:
                                     pass
                         else:
                             _tail_cap = int(float(os.getenv("AMC_RETURN_IMAGES_TAIL_MIB", "1.0") or 1.0) * 1024 * 1024)
-                            try:
-                                _raw = _shrink_image_bytes(_raw, _tail_cap, _pt.get("fmt") or "")
-                            except Exception:
-                                pass
+                            # 只在**超过尾图预算**时才压缩：
+                            # 原实现无条件调用 _shrink_image_bytes ⇒ 小于预算的图也被重编码，
+                            # 实测会出现 65KB→68KB、84KB→91KB 这类**无谓膨胀**，
+                            # 且 gold 图（常排在第 16 张之后）会被无谓重压、细节受损。
+                            if _raw and len(_raw) > _tail_cap:
+                                try:
+                                    _raw = _shrink_image_bytes(_raw, _tail_cap, _pt.get("fmt") or "")
+                                except Exception:
+                                    pass
                         if not _raw or _used + len(_raw) > _cap_total:
                             continue
                         _fmt = str(_pt.get("fmt") or "png").lower()

@@ -366,7 +366,7 @@ class Settings:
             reranker_candidates=env_int("AMC_RERANKER_CANDIDATES", 30),
             reranker_base_url=os.getenv(
                 "AMC_RERANKER_BASE_URL",
-                os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000"),
+                os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8002/v1"),
             ),
             reranker_api_key=os.getenv(
                 "AMC_RERANKER_API_KEY",
